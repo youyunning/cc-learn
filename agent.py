@@ -88,7 +88,7 @@ def run_glob(pattern: str) -> str:
         for match in g.glob(pattern,root_dir=WORKDIR):
             if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
                 results.append(match)
-            return "\n".join(results) if results else "No matches found."
+        return "\n".join(results) if results else "No matches found."
     except Exception as e:
         return f"Error: {e}"
 # ═══════════════════════════════════════════════════════════
@@ -131,10 +131,14 @@ def agent_loop(messages: list):
         results = []
         for block in response.content:
             if block.type == "tool_use":
+                if not check_permission(block):
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": "Permission denied."})
+                    continue
                 print(f"\033[33m> {block.name}\033[0m")
                 hander = TOOL_HANDLERS.get(block.name)
                 output = hander(**block.input) if hander else f"No handler for tool {block.name}"
-                print(str(output[:200]))
+                print(str(output)[:200])
                 results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -142,6 +146,83 @@ def agent_loop(messages: list):
                 })
         # 将assistant的工具调用和工具结果接入messages中，继续对话
         messages.append({"role": "user", "content": results})
+
+# ═══════════════════════════════════════════════════════════
+#  NEW in s03: 权限配置
+# ═══════════════════════════════════════════════════════════
+#规则一：禁止执行危险命令
+DENY_LIST = [
+    "rm -rf /", "sudo", "shutdown", "reboot", "> /dev/", "passwd", "chown", "chmod", "mkfs", "dd", "kill", "pkill",
+]
+def check_deny_list(command: str) -> str | None:
+    for d in DENY_LIST:
+        if d in command:
+            return f"Command is too dangerous to run: {d}"
+    return  None
+#规则二： 规则匹配
+PERMISSION_RULES = [
+    {
+        "tools": ["write_file", "edit_file"],
+        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
+        "message": "File path escapes workspace.",
+    }
+]
+def check_rules(tool_name: str, args: dict) -> str | None:
+    for rule in PERMISSION_RULES:
+        if tool_name in rule["tools"] and rule["check"](args):
+            return rule["message"]
+    return None
+
+# 规则三：命中后，暂停等用户输入
+def ask_user(tool_name: str, args: dict, reason: str) -> str:
+    print(f"\n⚠  {reason}")
+    print(f"   Tool: {tool_name}({args})")
+    choice = input("   Allow? [y/N] ").strip().lower()
+    return "allow" if choice in ("y", "yes") else "deny"
+def check_permission(block) -> bool:
+    # 闸门 1: 硬拒绝
+    if block.name == "bash":
+        reason = check_deny_list(block.input.get("command", ""))
+        if reason:
+            print(f"\n⛔ {reason}")
+            return False
+
+    # 闸门 2 + 3: 规则匹配 → 用户审批
+    reason = check_rules(block.name, block.input)
+    if reason:
+        decision = ask_user(block.name, block.input, reason)
+        if decision == "deny":
+            return False
+
+    return True
+
+# ═══════════════════════════════════════════════════════════
+#  NEW in s04: Hook注入
+# ═══════════════════════════════════════════════════════════
+#定义Hook生命周期
+HOOKS = {
+    "UserPromptSubmitted": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
+# 注册Hook
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hook(event: str, *kwargs):
+    for callback in HOOKS[event]:
+        result = callback(*kwargs)
+        if result is not None:
+            return result # 返回值 不等于 None hook就返回
+        return None
+# 用户输入提交后、进入LLM前触发
+def context_inject_hook(query: str) -> str | None:
+    """Inject current working directory info into every prompt."""
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None   # return None = no modification, let prompt through
+
+register_hook("UserPromptSubmit", context_inject_hook)
 
 
 if __name__ == "__main__":
