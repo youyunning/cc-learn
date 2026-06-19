@@ -1,6 +1,6 @@
 import ast, json, os, subprocess
 from pathlib import Path
-
+import yaml
 try:
     import readline
     # macOS 的 libedit 在处理中文输入时有退格问题，这四行修复它
@@ -22,11 +22,8 @@ client = Anthropic(
     api_key=os.getenv("ANTHROPIC_AUTH_TOKEN"),
 )
 MODEL = os.environ["MODEL_ID"]
+SKILLS_DIR = WORKDIR / "skills"
 
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "For complex sub-problems, use the task tool to spawn a subagent."
-)
 
 # s06: subagent gets its own system prompt — no task, no recursion
 SUB_SYSTEM = (
@@ -35,6 +32,50 @@ SUB_SYSTEM = (
     "Do not delegate further."
 )
 
+# ═══════════════════════════════════════════════════════════
+#  NEW in s07: SKILL技能
+# ═══════════════════════════════════════════════════════════
+SKILL_REGISTRY: dict[str, dict] = {}
+
+def _parse_frontmatter(text: str) -> tuple[dict, str]:
+    """Parse YAML frontmatter from SKILL.md. Returns (meta, body)."""
+    if not text.startswith("---"):
+        return {}, text
+    parts = text.split("---", 2)
+    if len(parts) < 3:
+        return {}, text
+    try:
+        meta = yaml.safe_load(parts[1]) or {}
+    except yaml.YAMLError:
+        meta = {}
+    return meta, parts[2].strip()
+def _scan_skills():
+    if not SKILLS_DIR.exists():
+        return
+    for d in sorted(SKILLS_DIR.iterdir()):
+        if not d.is_dir():
+            continue
+        manifest = d / "SKILL.md"
+        if manifest.exists():
+            raw = manifest.read_text()
+            meta, body = _parse_frontmatter(raw)
+            name = meta.get("name", d.name)
+            desc = meta.get("description", raw.split("\n")[0].lstrip("#").strip())
+            SKILL_REGISTRY[name] = {"name": name, "description": desc, "content": raw}
+
+_scan_skills()
+
+def list_skills() -> str:
+    return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
+def build_system_prompt() -> str:
+    catalog = list_skills()
+    return (
+        f"You are a coding agent at {WORKDIR}. "
+        f"Skills available:\n{catalog}\n"
+        "Use load_skill to get full details when needed."
+    )
+
+SYSTEM = build_system_prompt()
 
 # --工具调用 函数，执行bash命令并返回结果
 def run_bash(command: str) -> str:
@@ -105,6 +146,61 @@ def run_todo_write(todos: list) -> str:
         lines.append(f"  [{icon}] {t['content']}")
     print("\n".join(lines))
     return f"Updated {len(CURRENT_TODOS)} tasks"
+
+def load_skill(name: str) -> str:
+    skill = SKILL_REGISTRY.get(name)
+    if not skill:
+        return f"Skill not found: {name}"
+    return skill["content"]
+
+def extract_text(content) -> str:
+    """Extract text from message content blocks."""
+    if not isinstance(content, list):
+        return str(content)
+    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
+def spawn_subagent(description: str) -> str:
+    """Spawn a subagent with fresh messages[], return summary only."""
+    print(f"\n\033[35m[Subagent spawned]\033[0m")
+    messages = [{"role": "user", "content": description}]  # fresh context
+
+    for _ in range(30):  # safety limit
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        if response.stop_reason != "tool_use":
+            break
+        results = []
+        for block in response.content:
+            if block.type == "tool_use":
+                # Issue 1: subagent also runs hooks (permissions apply)
+                blocked = trigger_hook("PreToolUse", block)
+                if blocked:
+                    results.append({"type": "tool_result", "tool_use_id": block.id,
+                                    "content": str(blocked)})
+                    continue
+                handler = SUB_HANDLERS.get(block.name)
+                output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                trigger_hook("PostToolUse", block, output)
+                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+                results.append({"type": "tool_result", "tool_use_id": block.id,
+                                "content": output})
+        messages.append({"role": "user", "content": results})
+        # Issue 5: fallback if safety limit hit during tool_use
+
+    result = extract_text(messages[-1]["content"])
+    if not result:
+        # last message is tool_result, look backwards for assistant text
+        for msg in reversed(messages):
+            if msg["role"] == "assistant":
+                result = extract_text(msg["content"])
+                if result:
+                    break
+        if not result:
+            result = "Subagent stopped after 30 turns without final answer."
+    print(f"\033[35m[Subagent done]\033[0m")
+    return result  # only summary, entire message history discarded
 # ═══════════════════════════════════════════════════════════
 #  NEW in s02: 工具定义（s01 只有一个 bash，现在扩展到 5 个）
 # ═══════════════════════════════════════════════════════════
@@ -137,6 +233,13 @@ TOOLS = [
          },
      },
     },
+    {"name": "load_skill", "description": "Load the full content of a skill by name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
+{
+    "name": "task",
+    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
+    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
+},
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -146,6 +249,7 @@ TOOLS = [
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,  "todo_write": run_todo_write,
+    "task": spawn_subagent, "load_skill": load_skill,
 }
 rounds_since_todo = 0
 def agent_loop(messages: list):
@@ -344,62 +448,11 @@ SUB_HANDLERS = {
     "edit_file": run_edit, "glob": run_glob,
 }
 
-def extract_text(content) -> str:
-    """Extract text from message content blocks."""
-    if not isinstance(content, list):
-        return str(content)
-    return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
-def spawn_subagent(description: str) -> str:
-    """Spawn a subagent with fresh messages[], return summary only."""
-    print(f"\n\033[35m[Subagent spawned]\033[0m")
-    messages = [{"role": "user", "content": description}]  # fresh context
 
-    for _ in range(30):  # safety limit
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
-            break
-        results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                # Issue 1: subagent also runs hooks (permissions apply)
-                blocked = trigger_hook("PreToolUse", block)
-                if blocked:
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": str(blocked)})
-                    continue
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                trigger_hook("PostToolUse", block, output)
-                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
-        messages.append({"role": "user", "content": results})
-        # Issue 5: fallback if safety limit hit during tool_use
 
-    result = extract_text(messages[-1]["content"])
-    if not result:
-        # last message is tool_result, look backwards for assistant text
-        for msg in reversed(messages):
-            if msg["role"] == "assistant":
-                result = extract_text(msg["content"])
-                if result:
-                    break
-        if not result:
-            result = "Subagent stopped after 30 turns without final answer."
-    print(f"\033[35m[Subagent done]\033[0m")
-    return result  # only summary, entire message history discarded
 
-# Add task tool to parent's tools
-TOOLS.append({
-    "name": "task",
-    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
-})
-TOOL_HANDLERS["task"] = spawn_subagent
+
+
 
 
 if __name__ == "__main__":
