@@ -35,17 +35,6 @@ SUB_SYSTEM = (
     "Do not delegate further."
 )
 
-TOOLS = [{
-    "name": "bash",
-    "description": "run a shell command",
-    "input_schema": {
-        "type": "object",
-        "properties": {
-            "command": {"type": "string"},
-        },
-        "required": ["command"],
-    },
-}]
 
 # --工具调用 函数，执行bash命令并返回结果
 def run_bash(command: str) -> str:
@@ -53,7 +42,7 @@ def run_bash(command: str) -> str:
     if any(d in command for d in dangerous):
         return "Command is too dangerous to run."
     try:
-        result = subprocess.run(command, shell=True, cwd=os.getcwd(),
+        result = subprocess.run(command, shell=True, cwd=WORKDIR,
                            capture_output=True, text=True, timeout=120)
         return (result.stdout + result.stderr).strip()
     except subprocess.TimeoutExpired:
@@ -78,8 +67,10 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 def run_write(path: str, content: str) -> str:
     try:
-        safe_path(path).write_text(content)
-        return f"Write {len(content)} byes to {path}"
+        file_path = safe_path(path)
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text(content)
+        return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
 def run_edit(path: str, old_text: str, new_text: str) -> str:
@@ -189,8 +180,8 @@ def agent_loop(messages: list):
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": str(blocked)})
                 continue
-            hander = TOOL_HANDLERS.get(block.name)
-            output = hander(**block.input) if hander else f"No handler for tool {block.name}"
+            handler = TOOL_HANDLERS.get(block.name)
+            output = handler(**block.input) if handler else f"No handler for tool {block.name}"
             trigger_hook("PostToolUse", block, output)
 
             if block.name == "todo_write":
@@ -237,22 +228,6 @@ def ask_user(tool_name: str, args: dict, reason: str) -> str:
     print(f"   Tool: {tool_name}({args})")
     choice = input("   Allow? [y/N] ").strip().lower()
     return "allow" if choice in ("y", "yes") else "deny"
-def check_permission(block) -> bool:
-    # 闸门 1: 硬拒绝
-    if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n⛔ {reason}")
-            return False
-
-    # 闸门 2 + 3: 规则匹配 → 用户审批
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
-
-    return True
 
 # ═══════════════════════════════════════════════════════════
 #  NEW in s04: Hook注入
@@ -268,9 +243,9 @@ HOOKS = {
 def register_hook(event: str, callback):
     HOOKS[event].append(callback)
 
-def trigger_hook(event: str, *kwargs):
+def trigger_hook(event: str, *args):
     for callback in HOOKS[event]:
-        result = callback(*kwargs)
+        result = callback(*args)
         if result is not None:
             return result # 返回值 不等于 None hook就返回
     return None
@@ -284,9 +259,10 @@ def permission_hook(block) :
         for d in DENY_LIST:
             if d in block.input.get("command", ""):
                 print(f"\n⛔ [HOOK]Command is too dangerous to run: {d}")
+                return "Permission denied by user"
         for kw in DESTRUCTIVE:
             if kw in block.input.get("command", ""):
-                print(f"\n\033[HOOK][33m⚠  Potentially destructive command\033[0m")
+                print(f"\n\033[33m[HOOK] Potentially destructive command\033[0m")
                 print(f"   [HOOK]Tool: {block.name}({block.input})")
                 choice = input("   Allow? [y/N] ").strip().lower()
                 if choice not in ("y", "yes"):
@@ -295,7 +271,8 @@ def permission_hook(block) :
         if not (WORKDIR / block.input.get("path", "")).resolve().is_relative_to(WORKDIR):
             choice = input(f"\n⚠ File path escapes workspace: {block.input.get('path')}. Allow? [y/N] ").strip().lower()
             if choice not in ("y", "yes"):
-                print("⛔ [HOOK]Permission denied.")
+                return "Permission denied by user"
+
 # PreToolUse hook: before tool use, check permission
 def log_hook(block):
     print(f"\033[90m[HOOK] PreToolUse: {block.name}({block.input})\033[0m")
@@ -436,7 +413,7 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
-        trigger_hook("UserPromptSubmit", context_inject_hook)
+        trigger_hook("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
         agent_loop(history)
         # 打印与模型对话的最后一行的回复
