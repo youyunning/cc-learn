@@ -67,7 +67,7 @@ def select_relevant_memories(messages: list,max_item: int = 5) ->list[str]:
      recent_texts = []
      for msg in reversed(messages):
          if msg.get("role") == "user":
-             content = msg.get(" content","")
+             content = msg.get("content","")
              if isinstance(content,list):
                  content = " ".join(
                      str(getattr(b, "text", "")) for b in content
@@ -221,7 +221,7 @@ def extract_memories(messages: list):
             desc = mem.get("description","")
             body = mem.get("body","")
             if desc and body:
-                write_memory_file()
+                write_memory_file(name, mem_type, desc, body)
                 count += 1
         if count:
             print(f"\n\033[33m[Memory: extracted {count} new memories]\033[0m")
@@ -678,15 +678,8 @@ def agent_loop(messages: list):
                     **messages[memory_turn],
                     "content": memories_content + "\n\n" + messages[memory_turn]["content"],
                 }
-            request_messages = messages
-            if memories_content and memory_turn is not None and memory_turn < len(messages):
-                request_messages = messages.copy()
-                request_messages[memory_turn] = {
-                    **messages[memory_turn],
-                    "content": memories_content + "\n\n" + messages[memory_turn]["content"],
-                }
             response = client.messages.create(
-            model=MODEL, system=SYSTEM, messages=messages,
+            model=MODEL, system=system, messages=request_messages,
             tools=TOOLS, max_tokens=8000,
             )
             reactive_retries = 0  # reset on successful API call
