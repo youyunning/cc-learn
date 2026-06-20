@@ -627,6 +627,8 @@ TOOLS = [
     "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
     "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
 },
+    {"name": "compact", "description": "Summarize earlier conversation to free context space.",
+     "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -901,7 +903,7 @@ SUB_HANDLERS = {
 
 
 if __name__ == "__main__":
-    print("输入问题，回车发送。输入q退出。\n")
+    print("输入问题，回车发送。输入 q / quit / exit 退出。\n")
     # 用来记录与大模型的历史对话
     history =  []
     while True:
@@ -909,7 +911,7 @@ if __name__ == "__main__":
             query = input("\033[36ms01 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-        if query.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "quit", "exit", ""):
             break
         trigger_hook("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
