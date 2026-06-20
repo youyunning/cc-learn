@@ -1,13 +1,10 @@
-import ast, json, os, subprocess, time, re
+import ast, json, os, subprocess, time, re, random
 from pathlib import Path
+from dataclasses import dataclass, asdict
 import yaml
 try:
     import readline
-    # macOS 的 libedit 在处理中文输入时有退格问题，这四行修复它
     readline.parse_and_bind('set bind-tty-special-chars off')
-    readline.parse_and_bind('set input-meta on')
-    readline.parse_and_bind('set output-meta on')
-    readline.parse_and_bind('set convert-meta off')
 except ImportError:
     pass
 
@@ -34,6 +31,133 @@ SUB_SYSTEM = (
     "Complete the task you were given, then return a concise summary. "
     "Do not delegate further."
 )
+# ═══════════════════════════════════════════════════════════
+#  NEW in s12: task_system
+# ═══════════════════════════════════════════════════════════
+
+TASKS_DIR = WORKDIR / ".tasks"
+TASKS_DIR.mkdir(exist_ok=True)
+@dataclass
+class Task:
+    id: str
+    subject: str #人类可读的标题，描述要做什么
+    description: str
+    status: str # pending | in_progress | completed
+    owner: str | None # Agent名
+    blockedBy: list[str] #依赖的任务ID 列表
+def _task_path(task_id: str) -> Path:
+    return TASKS_DIR / f"{task_id}.json"
+def create_task(subject: str, description: str = "",
+                blockedBy: list[str] | None = None) -> Task:
+    task = Task(
+        id=f"task_{int(time.time())}_{random.randint(0, 9999):04d}",
+        subject=subject,
+        description=description,
+        status="pending",
+        owner=None,
+        blockedBy=blockedBy or [],
+    )
+    save_task(task)
+    return task
+
+def save_task(task: Task):
+    _task_path(task.id).write_text(json.dumps(asdict(task), indent=2))
+
+def load_task(task_id: str) -> Task:
+    return Task(**json.loads(_task_path(task_id).read_text()))
+
+
+def list_tasks() -> list[Task]:
+    return [Task(**json.loads(p.read_text()))
+            for p in sorted(TASKS_DIR.glob("task_*.json"))]
+
+
+def get_task(task_id: str) -> str:
+    """Return full task details as JSON."""
+    task = load_task(task_id)
+    return json.dumps(asdict(task), indent=2)
+
+def can_start(task_id: str) -> bool:
+    """Check if all blockedBy dependencies are completed.
+    Missing dependencies are treated as blocked."""
+    task = load_task(task_id)
+    for dep_id in task.blockedBy:
+        if not  _task_path(dep_id).exists():
+            return False
+        if load_task(dep_id).status != "completed":
+            return False
+    return True
+def claim_task(task_id: str, owner: str = "agent") -> str:
+    task = load_task(task_id)
+    if task.status != "pending":
+        return f"Task {task_id} is {task.status} cannot claimed."
+    if not can_start(task_id):
+        deps = [d for d in task.blockedBy
+                if load_task(d).status != "completed"]
+        return f"Blocked by: {deps}"
+    task.owner = owner
+    task.status = "in_progress"
+    save_task(task)
+    return f"Task {task_id} ({task.subject})claimed."
+
+def complete_task(task_id: str, owner: str = "agent") -> str:
+    task = load_task(task_id)
+    task.status = "completed"
+    save_task(task)
+    # 找出被解锁的下游任务
+    unblocked = [t.subject for t in list_tasks() if t.status == "pending" and t.blockedBy and can_start(t.id)]
+    msg = f"Task {task_id} ({task.subject}) completed."
+    if unblocked:
+        msg += f"\nUnblocked: {', '.join(unblocked)}"
+    return msg
+# ═══════════════════════════════════════════════════════════
+#  NEW in s10: System Prompt
+# ═══════════════════════════════════════════════════════════
+# ── Prompt Sections ──
+
+PROMPT_SECTIONS = {
+    "identity": "You are a coding agent. Act, don't explain.",
+    "tools": "Available tools: bash, read_file, write_file.",
+    "workspace": f"Working directory: {WORKDIR}",
+    "memory": "Relevant memories are injected below when available.",
+}
+def assemble_system_prompt(context:list) -> str:
+    sections = []
+    #始终加载
+    sections.append(PROMPT_SECTIONS["identity"])
+    sections.append(PROMPT_SECTIONS["tools"])
+    sections.append(PROMPT_SECTIONS["workspace"])
+
+    #按需加载
+    memories = context.get("memories", "")
+    if memories:
+        sections.append(f"Relevant memories:\n{memories}")
+    return "\n\n".join(sections)
+
+_last_context_key = None
+_last_prompt = None
+
+def get_system_prompt(context:dict) -> str:
+    global _last_context_key, _last_prompt
+    key = json.dumps(context, sort_keys=True, ensure_ascii=False, default=str)
+    if key == _last_context_key and _last_prompt:
+        return _last_prompt
+    _last_context_key = key
+    _last_prompt = assemble_system_prompt(context)
+    return _last_prompt
+
+def update_context(context: dict, messages: list) -> dict:
+    """Derive context from real state: which tools exist, whether memory files exist."""
+    memories = ""
+    if MEMORY_INDEX.exists():
+        content = MEMORY_INDEX.read_text().strip()
+        if content:
+            memories = content
+    return {
+        "enabled_tools": list(TOOL_HANDLERS.keys()),
+        "workspace": str(WORKDIR),
+        "memories": memories,
+    }
 
 # ═══════════════════════════════════════════════════════════
 #  NEW in s09: Memory System
@@ -629,6 +753,34 @@ TOOLS = [
 },
     {"name": "compact", "description": "Summarize earlier conversation to free context space.",
      "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
+    {"name": "create_task",
+     "description": "Create a new task with optional blockedBy dependencies.",
+     "input_schema": {"type": "object",
+                      "properties": {
+                          "subject": {"type": "string"},
+                          "description": {"type": "string"},
+                          "blockedBy": {"type": "array",
+                                        "items": {"type": "string"}}},
+                      "required": ["subject"]}},
+    {"name": "list_tasks",
+     "description": "List all tasks with status, owner, and dependencies.",
+     "input_schema": {"type": "object", "properties": {},
+                      "required": []}},
+    {"name": "get_task",
+     "description": "Get full details of a specific task by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "claim_task",
+     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
+    {"name": "complete_task",
+     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+     "input_schema": {"type": "object",
+                      "properties": {"task_id": {"type": "string"}},
+                      "required": ["task_id"]}},
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -638,19 +790,21 @@ TOOLS = [
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
     "edit_file": run_edit, "glob": run_glob,  "todo_write": run_todo_write,
-    "task": spawn_subagent, "load_skill": load_skill,
+    "task": spawn_subagent, "load_skill": load_skill,  "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "get_task": run_get_task, "claim_task": run_claim_task,
+    "complete_task": run_complete_task,
 }
 rounds_since_todo = 0
 
 MAX_REACTIVE_RETRIES = 1
-def agent_loop(messages: list):
+def agent_loop(messages: list, context: dict):
     global rounds_since_todo
     reactive_retries = 0
     # s09: inject relevant memory content into the current user turn
     memories_content = load_memories(messages)
     memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
     # s09: build system once per user turn; memory is updated after the loop returns
-    system = build_system()
+    system = get_system_prompt(context)
 
     while True:
         pre_compress = [m if isinstance(m, dict) else {"role": m.get("role", ""),
@@ -734,7 +888,8 @@ def agent_loop(messages: list):
             handler = TOOL_HANDLERS.get(block.name)
             output = handler(**block.input) if handler else f"No handler for tool {block.name}"
             trigger_hook("PostToolUse", block, output)
-
+            context = update_context(context, messages)
+            system = get_system_prompt(context)
             if block.name == "todo_write":
                 rounds_since_todo = 0
 
@@ -906,6 +1061,7 @@ if __name__ == "__main__":
     print("输入问题，回车发送。输入 q / quit / exit 退出。\n")
     # 用来记录与大模型的历史对话
     history =  []
+    context = update_context({},[])
     while True:
         try:
             query = input("\033[36ms01 >> \033[0m")
@@ -915,7 +1071,7 @@ if __name__ == "__main__":
             break
         trigger_hook("UserPromptSubmit", query)
         history.append({"role": "user", "content": query})
-        agent_loop(history)
+        agent_loop(history,context)
         # 打印与模型对话的最后一行的回复
         response_content = history[-1]["content"]
         if isinstance(response_content, list):
