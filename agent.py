@@ -54,7 +54,7 @@ class MCPClient:
         """Simulates tools/call."""
         handler = self.handlers.get(tool_name)
         if not handler:
-            return "MACP error: unknown tool'{tool_name}'"
+            return f"MCP error: unknown tool '{tool_name}'"
         try:
             return handler(**args)
         except Exception as e:
@@ -174,12 +174,13 @@ def validate_worktree_name(name: str) -> str | None:
 def run_git(args: list[str]) -> tuple[bool, str]:
     """Run git command. Return (ok, output)."""
     try:
-        r = subprocess.run(["git", *args], cwd=WORKTREES_DIR,capture_output=True,text=True,timeout=30)
-        out = (r.stdout, r.stderr).strip()
+        r = subprocess.run(["git"] + args, cwd=WORKDIR,
+                           capture_output=True, text=True, timeout=30)
+        out = (r.stdout + r.stderr).strip()
         out = out[:5000] if out else "(no output)"
         return r.returncode == 0, out
     except subprocess.TimeoutExpired:
-        return False, f"Git command timed out"
+        return False, "Error: git timeout"
 def log_event(event_type: str, worktree_name: str, task_id: str = ""):
     """Append a lifecycle event to events.jsonl."""
     event = {"type": event_type, "worktree": worktree_name,
@@ -192,13 +193,20 @@ def create_worktree(name: str, task_id:str ="") -> str:
     err = validate_worktree_name(name)
     if err:
         return f"Error: {err}"
-    path = WORKDIR / name
+    if task_id:
+        try:
+            load_task(task_id)
+        except FileNotFoundError:
+            return f"Error: task {task_id} not found"
+    path = WORKTREES_DIR / name
+    if path.exists():
+        return f"Worktree '{name}' already exists at {path}"
     ok, result = run_git(["worktree", "add", str(path), "-b", f"wt/{name}", "HEAD"])
     if not ok:
-        return f"GitError: {result}"
+        return f"Git error: {result}"
     if task_id:
-        bind_task_to_worktree(task_id, path)
-    log_event("create",name,task_id)
+        bind_task_to_worktree(task_id, name)
+    log_event("create", name, task_id)
     print(f"  \033[33m[worktree] created: {name} at {path}\033[0m")
     return f"Worktree '{name}' created at {path}"
 
@@ -208,6 +216,63 @@ def bind_task_to_worktree(task_id: str, worktree_name: str):
     task.worktree = worktree_name
     save_task(task)
     print(f"  \033[33m[bind] {task.subject} → worktree:{worktree_name}\033[0m")
+
+
+def _count_worktree_changes(path: Path) -> tuple[int, int]:
+    try:
+        r1 = subprocess.run(["git", "status", "--porcelain"],
+                            cwd=path, capture_output=True, text=True, timeout=10)
+        files = len([l for l in r1.stdout.strip().splitlines() if l.strip()])
+        r2 = subprocess.run(["git", "log", "@{push}..HEAD", "--oneline"],
+                            cwd=path, capture_output=True, text=True, timeout=10)
+        commits = len([l for l in r2.stdout.strip().splitlines() if l.strip()])
+        return files, commits
+    except Exception:
+        return -1, -1
+
+
+def remove_worktree(name: str, discard_changes: bool = False) -> str:
+    err = validate_worktree_name(name)
+    if err:
+        return err
+    path = WORKTREES_DIR / name
+    if not path.exists():
+        return f"Worktree '{name}' not found"
+    if not discard_changes:
+        files, commits = _count_worktree_changes(path)
+        if files < 0:
+            return "Cannot verify status. Use discard_changes=true to force."
+        if files > 0 or commits > 0:
+            return (f"Worktree '{name}' has {files} file(s), {commits} commit(s). "
+                    "Use discard_changes=true or keep_worktree.")
+    ok1, _ = run_git(["worktree", "remove", str(path), "--force"])
+    if not ok1:
+        return f"Failed to remove worktree '{name}'"
+    run_git(["branch", "-D", f"wt/{name}"])
+    log_event("remove", name)
+    print(f"  \033[33m[worktree] removed: {name}\033[0m")
+    return f"Worktree '{name}' removed"
+
+
+def keep_worktree(name: str) -> str:
+    err = validate_worktree_name(name)
+    if err:
+        return err
+    log_event("keep", name)
+    return f"Worktree '{name}' kept for review (branch: wt/{name})"
+
+
+def run_create_worktree(name: str, task_id: str = "") -> str:
+    return create_worktree(name, task_id)
+
+
+def run_remove_worktree(name: str, discard_changes: bool = False) -> str:
+    return remove_worktree(name, discard_changes)
+
+
+def run_keep_worktree(name: str) -> str:
+    return keep_worktree(name)
+
 # ═══════════════════════════════════════════════════════════
 #  NEW in s17: autonomous_agents
 # ═══════════════════════════════════════════════════════════
@@ -226,7 +291,8 @@ def scan_unclaimed_tasks() -> list[dict]:
     return unclaimed
 
 def idle_poll(agent_name: str, messages: list,
-              name: str, role: str) -> str:
+              name: str, role: str,
+              worktree_context: dict | None = None) -> str:
     """Poll for 60s. Return 'work', 'shutdown', or 'timeout'."""
     for _ in range(IDLE_TIMEOUT // IDLE_POLL_INTERVAL):
         time.sleep(IDLE_POLL_INTERVAL)
@@ -238,7 +304,7 @@ def idle_poll(agent_name: str, messages: list,
             for msg in inbox:
                 if msg.get("type") == "shutdown_request":
                     req_id = msg.get("metadata", {}).get("request_id", "")
-                    BUS.send(name, "lead", "Shutting down gracefully.",
+                    BUS.send(name, "lead", "Shutting down.",
                              "shutdown_response",
                              {"request_id": req_id, "approve": True})
                     print(f"  \033[35m[protocol] {name} approved shutdown "
@@ -254,14 +320,20 @@ def idle_poll(agent_name: str, messages: list,
         # Scan task board
         unclaimed = scan_unclaimed_tasks()
         if unclaimed:
-            task = unclaimed[0]
-            result = claim_task(task["id"], agent_name)
+            task_data = unclaimed[0]
+            result = claim_task(task_data["id"], agent_name)
             if "Claimed" in result:
+                wt_info = ""
+                if task_data.get("worktree"):
+                    wt_path = WORKTREES_DIR / task_data["worktree"]
+                    wt_info = f"\nWork directory: {wt_path}"
+                    if worktree_context is not None:
+                        worktree_context["path"] = str(wt_path)
                 messages.append({"role": "user",
-                    "content": f"<auto-claimed>Task {task['id']}: "
-                               f"{task['subject']}</auto-claimed>"})
+                    "content": f"<auto-claimed>Task {task_data['id']}: "
+                               f"{task_data['subject']}{wt_info}</auto-claimed>"})
                 print(f"  \033[32m[idle] {name} auto-claimed: "
-                      f"{task['subject']}\033[0m")
+                      f"{task_data['subject']}\033[0m")
                 return "work"
             print(f"  \033[33m[idle] {name} claim failed: "
                   f"{result}\033[0m")
@@ -279,41 +351,51 @@ class ProtocolState:
     target: str          # 接收方
     status: str          # pending | approved | rejected
     payload: str         # 计划文本或关机原因
-    created_at: float    # 时间戳
+    created_at: float = field(default_factory=time.time)
+
 pending_results: dict[str, ProtocolState] = {}
 
-def handle_inbox_message(name,msg,messages):
-    msg_type = msg.get("type","message")
-    req_id = msg.get("metadata",{}).get("request_id","")
+
+def new_request_id() -> str:
+    return f"req_{random.randint(0, 999999):06d}"
+
+def handle_inbox_message(name, msg, messages, protocol_ctx: dict = None):
+    msg_type = msg.get("type", "message")
+    req_id = msg.get("metadata", {}).get("request_id", "")
 
     if msg_type == "shutdown_request":
-        BUS.send(name,"lead", "Shutting down...","shutdown_response",{"request_id":req_id,"approve":True})
-        return True # 停止循环
+        BUS.send(name, "lead", "Shutting down...", "shutdown_response",
+                 {"request_id": req_id, "approve": True})
+        return True  # 停止循环
     if msg_type == "plan_approval_response":
-        approve = msg.get("metadata",{}).get("approved",False)
-        messages.append({"role":"user","content": "[Plan approved]" if approve else "[Plan denied]",})
+        approve = msg.get("metadata", {}).get("approved", False)
+        if protocol_ctx is not None and req_id == protocol_ctx.get("waiting_plan"):
+            protocol_ctx["waiting_plan"] = None
+        messages.append({"role": "user",
+                         "content": "[Plan approved]" if approve
+                         else f"[Plan rejected] {msg['content']}"})
     return False
 
-def match_response(response_type,request_id, approve):
-    status = pending_results.get(request_id)
-    if status is not None:
+def match_response(response_type, request_id, approve):
+    state = pending_results.get(request_id)
+    if not state:
         return
-    if status.type == "shutdown" and response_type != "shutdown_response":
+    if state.type == "shutdown" and response_type != "shutdown_response":
         return
-    if status.type == "plan_approval" and response_type != "plan_approval_response":
+    if state.type == "plan_approval" and response_type != "plan_approval_response":
         return
-    if status.status != "pending":
-        print(f"  \033[33m[protocol] {request_id} already {status.status}, "
+    if state.status != "pending":
+        print(f"  \033[33m[protocol] {request_id} already {state.status}, "
               f"ignoring duplicate\033[0m")
         return
-    status.status = "approved" if approve else "rejected"
+    state.status = "approved" if approve else "rejected"
     icon = "✓" if approve else "✗"
     color = "32" if approve else "31"
-    print(f"  \033[{color}m[protocol] {status.type} {icon} "
-          f"({request_id}: {status.status})\033[0m")
-def consume_lead_inbox(route_procotol= True) -> list[dict]:
+    print(f"  \033[{color}m[protocol] {state.type} {icon} "
+          f"({request_id}: {state.status})\033[0m")
+def consume_lead_inbox(route_protocol=True) -> list[dict]:
     msgs = BUS.read_inbox("lead")
-    if route_procotol:
+    if route_protocol:
         for msg in msgs:
             meta = msg.get("metadata",{})
             req_id = meta.get("request_id","")
@@ -321,27 +403,74 @@ def consume_lead_inbox(route_procotol= True) -> list[dict]:
             if req_id and msg_type.endswith("_response"):
                 match_response(msg_type,req_id,meta.get("approve",False))
     return msgs
+
+
+# ── Lead Protocol Tools ──
+
+def run_request_shutdown(teammate: str) -> str:
+    req_id = new_request_id()
+    pending_results[req_id] = ProtocolState(
+        request_id=req_id, type="shutdown",
+        sender="lead", target=teammate,
+        status="pending", payload="")
+    BUS.send("lead", teammate, "Shut down.", "shutdown_request",
+             {"request_id": req_id})
+    return f"Shutdown request sent to {teammate}"
+
+
+def run_request_plan(teammate: str, task: str) -> str:
+    BUS.send("lead", teammate, f"Submit plan for: {task}", "message")
+    return f"Asked {teammate} to submit a plan"
+
+
+def run_review_plan(request_id: str, approve: bool,
+                    feedback: str = "") -> str:
+    state = pending_results.get(request_id)
+    if not state:
+        return f"Request {request_id} not found"
+    state.status = "approved" if approve else "rejected"
+    BUS.send("lead", state.sender,
+             feedback or ("Approved" if approve else "Rejected"),
+             "plan_approval_response",
+             {"request_id": request_id, "approve": approve})
+    return f"Plan {'approved' if approve else 'rejected'}"
+
+
+def _teammate_submit_plan(from_name: str, plan: str) -> str:
+    req_id = new_request_id()
+    pending_results[req_id] = ProtocolState(
+        request_id=req_id, type="plan_approval",
+        sender=from_name, target="lead",
+        status="pending", payload=plan)
+    BUS.send(from_name, "lead", plan,
+             "plan_approval_request",
+             {"request_id": req_id})
+    return f"Plan submitted ({req_id})"
+
 # ═══════════════════════════════════════════════════════════
 #  NEW in s15: agent_teams
 # ═══════════════════════════════════════════════════════════
 class MessageBus:
-    def send(self, from_agent: str, to_agent: str, content: str, message_type: str = "message"):
+    def send(self, from_agent: str, to_agent: str, content: str, message_type: str = "message", metadata: dict = None):
         msg = {
             "from": from_agent,
             "to": to_agent,
             "content": content,
             "type": message_type,
-            "ts": int(time.time()),}
+            "ts": time.time(),
+            "metadata": metadata or {},
+        }
         inbox = MAILBOX_DIR / f"{to_agent}.jsonl"
-        with open(inbox, "w") as f:
+        with open(inbox, "a") as f:
             f.write(json.dumps(msg) + "\n")
         print(f"  \033[33m[bus] {from_agent} → {to_agent}: "
-              f"{content[:50]}\033[0m")
+              f"({message_type}) {content[:50]}\033[0m")
+
     def read_inbox(self, agent: str) -> list[dict]:
         inbox = MAILBOX_DIR / f"{agent}.jsonl"
         if not inbox.exists():
             return []
-        msgs = [json.loads(line) for line in inbox.read_text().split("\n") if line.strip()]
+        msgs = [json.loads(line) for line in inbox.read_text().splitlines() if line.strip()]
         inbox.unlink()
         return msgs
 
@@ -351,69 +480,168 @@ active_teammates: dict[str, bool] = {}
 
 def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
     """Spawn a teammate agent in a background thread.
-    Teaching version: max 10 rounds per teammate.
-    Real CC: teammates use idle loop (wait for inbox, work, repeat)
-    until shutdown_request."""
+    Uses idle loop: wait for inbox, work, repeat until shutdown_request."""
     if name in active_teammates:
-        return f"Teammate {name} already spawned."
+        return f"Teammate '{name}' already exists"
 
+    protocol_ctx = {"waiting_plan": None}
     system = (f"You are '{name}', a {role}. "
               f"Use tools to complete tasks. "
-              f"Send results via send_message to 'lead'.")
+              f"If a task has a worktree, work in that directory.")
+
     def run():
+        wt_ctx = {"path": None}
+
+        def _wt_cwd():
+            p = wt_ctx["path"]
+            return Path(p) if p else None
+
+        def _run_bash(command: str) -> str:
+            return run_bash(command, cwd=_wt_cwd())
+
+        def _run_read(path: str, limit: int = None, offset: int = 0) -> str:
+            return run_read(path, limit=limit, offset=offset, cwd=_wt_cwd())
+
+        def _run_write(path: str, content: str) -> str:
+            return run_write(path, content, cwd=_wt_cwd())
+
+        def _run_list_tasks():
+            tasks = list_tasks()
+            if not tasks:
+                return "No tasks."
+            return "\n".join(
+                f"  {t.id}: {t.subject} [{t.status}]"
+                + (f" (wt:{t.worktree})" if t.worktree else "")
+                for t in tasks)
+
+        def _run_claim_task(task_id: str):
+            result = claim_task(task_id, owner=name)
+            if "Claimed" in result:
+                task = load_task(task_id)
+                wt_ctx["path"] = (str(WORKTREES_DIR / task.worktree)
+                                  if task.worktree else None)
+            return result
+
+        def _run_complete_task(task_id: str):
+            result = complete_task(task_id)
+            wt_ctx["path"] = None
+            return result
+
         messages = [{"role": "user", "content": prompt}]
         sub_tools = [
             {"name": "bash", "description": "Run a shell command.",
              "input_schema": {"type": "object",
                               "properties": {"command": {"type": "string"}},
                               "required": ["command"]}},
-            {"name": "read_file", "description": "Read file contents.",
+            {"name": "read_file", "description": "Read file.",
              "input_schema": {"type": "object",
-                              "properties": {"path": {"type": "string"}},
+                              "properties": {"path": {"type": "string"},
+                                             "limit": {"type": "integer"},
+                                             "offset": {"type": "integer"}},
                               "required": ["path"]}},
-            {"name": "write_file", "description": "Write content to a file.",
+            {"name": "write_file", "description": "Write file.",
              "input_schema": {"type": "object",
                               "properties": {"path": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["path", "content"]}},
             {"name": "send_message",
-             "description": "Send a message to another agent.",
+             "description": "Send message to another agent.",
              "input_schema": {"type": "object",
                               "properties": {"to": {"type": "string"},
                                              "content": {"type": "string"}},
                               "required": ["to", "content"]}},
+            {"name": "submit_plan",
+             "description": "Submit a plan for Lead approval.",
+             "input_schema": {"type": "object",
+                              "properties": {"plan": {"type": "string"}},
+                              "required": ["plan"]}},
+            {"name": "list_tasks",
+             "description": "List all tasks.",
+             "input_schema": {"type": "object", "properties": {},
+                              "required": []}},
+            {"name": "claim_task",
+             "description": "Claim a pending task.",
+             "input_schema": {"type": "object",
+                              "properties": {"task_id": {"type": "string"}},
+                              "required": ["task_id"]}},
+            {"name": "complete_task",
+             "description": "Mark an in-progress task as completed.",
+             "input_schema": {"type": "object",
+                              "properties": {"task_id": {"type": "string"}},
+                              "required": ["task_id"]}},
         ]
+
         sub_handlers = {
-            "bash": run_bash, "read_file": run_read, "write_file": run_write,
+            "bash": _run_bash, "read_file": _run_read,
+            "write_file": _run_write,
             "send_message": lambda to, content: (BUS.send(name, to, content),
-                                                 "Sent")[1],
+                                                  "Sent")[1],
+            "list_tasks": _run_list_tasks,
+            "claim_task": _run_claim_task,
+            "complete_task": _run_complete_task,
         }
 
-        for _ in range(10):
-            inbox = BUS.read_inbox(name)
-            if inbox:
-                messages.append({"role": "user",
-                                 "content": f"<inbox>{json.dumps(inbox)}</inbox>"})
-            try:
-                response = client.messages.create(
-                    model=MODEL, system=system, messages=messages[-20:],
-                    tools=sub_tools, max_tokens=8000)
-            except Exception:
+        while True:
+            if len(messages) <= 3:
+                messages.insert(0, {"role": "user",
+                    "content": f"<identity>You are '{name}', role: {role}. "
+                               f"Continue your work.</identity>"})
+            should_shutdown = False
+            for _ in range(10):
+                inbox = BUS.read_inbox(name)
+                for msg in inbox:
+                    stopped = handle_inbox_message(name, msg, messages, protocol_ctx)
+                    if stopped:
+                        should_shutdown = True
+                        break
+                if should_shutdown:
+                    break
+                if protocol_ctx["waiting_plan"]:
+                    time.sleep(IDLE_POLL_INTERVAL)
+                    continue
+                if inbox and not should_shutdown:
+                    non_protocol = [m for m in inbox
+                                    if m.get("type") == "message"]
+                    if non_protocol:
+                        messages.append({"role": "user",
+                            "content": "<inbox>" + json.dumps(non_protocol) + "</inbox>"})
+                try:
+                    response = client.messages.create(
+                        model=MODEL, system=system, messages=messages[-20:],
+                        tools=sub_tools, max_tokens=8000)
+                except Exception:
+                    break
+                messages.append({"role": "assistant", "content": response.content})
+                if not has_tool_use(response.content):
+                    break
+                results = []
+                for block in response.content:
+                    if block.type == "tool_use":
+                        if block.name == "submit_plan":
+                            output = _teammate_submit_plan(
+                                name, block.input.get("plan", ""))
+                            match = re.search(r"\((req_\d+)\)", output)
+                            protocol_ctx["waiting_plan"] = (
+                                match.group(1) if match else output)
+                        else:
+                            handler = sub_handlers.get(block.name)
+                            output = handler(**block.input) if handler else f"Unknown: {block.name}"
+                        results.append({"type": "tool_result",
+                                        "tool_use_id": block.id,
+                                        "content": str(output)})
+                        if protocol_ctx["waiting_plan"]:
+                            break
+                messages.append({"role": "user", "content": results})
+                if protocol_ctx["waiting_plan"]:
+                    break
+            if should_shutdown:
                 break
-            messages.append({"role": "assistant", "content": response.content})
-            if response.stop_reason != "tool_use":
+            if protocol_ctx["waiting_plan"]:
+                continue
+            idle_result = idle_poll(name, messages, name, role)
+            if idle_result in ("shutdown", "timeout"):
                 break
-            results = []
-            for block in response.content:
-                if block.type == "tool_use":
-                    handler = sub_handlers.get(block.name)
-                    output = handler(**block.input) if handler else "Unknown"
-                    results.append({"type": "tool_result",
-                                    "tool_use_id": block.id,
-                                    "content": str(output)})
-            messages.append({"role": "user", "content": results})
 
-        # Send final summary to Lead
         summary = "Done."
         for msg in reversed(messages):
             if msg["role"] == "assistant" and isinstance(msg["content"], list):
@@ -428,6 +656,11 @@ def spawn_teammate_thread(name: str, role: str, prompt: str) -> str:
         active_teammates.pop(name, None)
         print(f"  \033[32m[teammate] {name} finished\033[0m")
 
+    active_teammates[name] = True
+    threading.Thread(target=run, daemon=True).start()
+    return f"Teammate '{name}' spawned as {role}"
+
+
 # ── Team Tool Handlers (s15 new) ──
 
 def run_spawn_teammate(name: str, role: str, prompt: str) -> str:
@@ -440,12 +673,15 @@ def run_send_message(to: str, content: str) -> str:
 
 
 def run_check_inbox() -> str:
-    msgs = BUS.read_inbox("lead")
+    msgs = consume_lead_inbox(route_protocol=True)
     if not msgs:
         return "(inbox empty)"
     lines = []
     for m in msgs:
-        lines.append(f"  [{m['from']}] {m['content'][:200]}")
+        meta = m.get("metadata", {})
+        req_id = meta.get("request_id", "")
+        tag = f" [{m['type']} req:{req_id}]" if req_id else f" [{m['type']}]"
+        lines.append(f"  [{m['from']}]{tag} {m['content'][:200]}")
     return "\n".join(lines)
 
 # ═══════════════════════════════════════════════════════════
@@ -708,10 +944,9 @@ def is_slow_operation(tool_name: str, tool_input: dict) -> bool:
                      "cargo build", "pytest", "make"]
     return any(kw in cmd for kw in slow_keywords)
 def should_run_background(tool_name: str, tool_input: dict) -> bool:
-    """Model explicit request takes priority; fallback to heuristic."""
-    if tool_input.get("run_in_background"):
-        return True
-    return is_slow_operation(tool_name, tool_input)
+    if tool_name != "bash":
+        return False
+    return bool(tool_input.get("run_in_background")) or is_slow_operation(tool_name, tool_input)
 
 def execute_tool(block) -> str:
     """Execute a tool call block, return output."""
@@ -781,11 +1016,12 @@ TASKS_DIR.mkdir(exist_ok=True)
 @dataclass
 class Task:
     id: str
-    subject: str #人类可读的标题，描述要做什么
+    subject: str  # 人类可读的标题，描述要做什么
     description: str
-    status: str # pending | in_progress | completed
-    owner: str | None # Agent名
-    blockedBy: list[str] #依赖的任务ID 列表
+    status: str  # pending | in_progress | completed
+    owner: str | None  # Agent名
+    blockedBy: list[str]  # 依赖的任务ID 列表
+    worktree: str | None = None
 def _task_path(task_id: str) -> Path:
     return TASKS_DIR / f"{task_id}.json"
 def create_task(subject: str, description: str = "",
@@ -831,23 +1067,36 @@ def can_start(task_id: str) -> bool:
 def claim_task(task_id: str, owner: str = "agent") -> str:
     task = load_task(task_id)
     if task.status != "pending":
-        return f"Task {task_id} is {task.status} cannot claimed."
+        return f"Task {task_id} is {task.status}, cannot claim"
+    if task.owner:
+        return f"Task {task_id} already owned by {task.owner}"
     if not can_start(task_id):
         deps = [d for d in task.blockedBy
-                if load_task(d).status != "completed"]
-        return f"Blocked by: {deps}"
+                if _task_path(d).exists() and load_task(d).status != "completed"]
+        missing = [d for d in task.blockedBy if not _task_path(d).exists()]
+        parts = []
+        if deps:
+            parts.append(f"blocked by: {deps}")
+        if missing:
+            parts.append(f"missing deps: {missing}")
+        return "Cannot start — " + ", ".join(parts)
     task.owner = owner
     task.status = "in_progress"
     save_task(task)
-    return f"Task {task_id} ({task.subject})claimed."
+    print(f"  \033[36m[claim] {task.subject} → in_progress\033[0m")
+    return f"Claimed {task.id} ({task.subject})"
 
-def complete_task(task_id: str, owner: str = "agent") -> str:
+def complete_task(task_id: str) -> str:
     task = load_task(task_id)
+    if task.status != "in_progress":
+        return f"Task {task_id} is {task.status}, cannot complete"
     task.status = "completed"
     save_task(task)
     # 找出被解锁的下游任务
-    unblocked = [t.subject for t in list_tasks() if t.status == "pending" and t.blockedBy and can_start(t.id)]
-    msg = f"Task {task_id} ({task.subject}) completed."
+    unblocked = [t.subject for t in list_tasks()
+                 if t.status == "pending" and t.blockedBy and can_start(t.id)]
+    print(f"  \033[32m[complete] {task.subject} ✓\033[0m")
+    msg = f"Completed {task.id} ({task.subject})"
     if unblocked:
         msg += f"\nUnblocked: {', '.join(unblocked)}"
     return msg
@@ -858,21 +1107,32 @@ def complete_task(task_id: str, owner: str = "agent") -> str:
 
 PROMPT_SECTIONS = {
     "identity": "You are a coding agent. Act, don't explain.",
-    "tools": "Available tools: bash, read_file, write_file.",
+    "tools": "Available tools: bash, read_file, write_file, edit_file, glob, "
+             "todo_write, task, load_skill, compact, "
+             "create_task, list_tasks, get_task, claim_task, complete_task, "
+             "schedule_cron, list_crons, cancel_cron, "
+             "spawn_teammate, send_message, check_inbox, "
+             "request_shutdown, request_plan, review_plan, "
+             "create_worktree, remove_worktree, keep_worktree, "
+             "connect_mcp. MCP tools are prefixed mcp__{server}__{tool}.",
     "workspace": f"Working directory: {WORKDIR}",
     "memory": "Relevant memories are injected below when available.",
 }
-def assemble_system_prompt(context:list) -> str:
+
+
+def assemble_system_prompt(context: dict) -> str:
     sections = []
-    #始终加载
     sections.append(PROMPT_SECTIONS["identity"])
     sections.append(PROMPT_SECTIONS["tools"])
     sections.append(PROMPT_SECTIONS["workspace"])
-
-    #按需加载
-    memories = context.get("memories", "")
-    if memories:
-        sections.append(f"Relevant memories:\n{memories}")
+    sections.append(f"Current time: {datetime.now().isoformat(timespec='seconds')}")
+    sections.append("Skills catalog:\n" + list_skills() +
+                    "\nUse load_skill(name) when a skill is relevant.")
+    if context.get("memories"):
+        sections.append(f"Relevant memories:\n{context['memories']}")
+    mcp_names = list(mcp_clients.keys())
+    if mcp_names:
+        sections.append(f"Connected MCP servers: {', '.join(mcp_names)}")
     return "\n\n".join(sections)
 
 _last_context_key = None
@@ -891,13 +1151,11 @@ def update_context(context: dict, messages: list) -> dict:
     """Derive context from real state: which tools exist, whether memory files exist."""
     memories = ""
     if MEMORY_INDEX.exists():
-        content = MEMORY_INDEX.read_text().strip()
-        if content:
-            memories = content
+        memories = MEMORY_INDEX.read_text()[:2000]
     return {
-        "enabled_tools": list(TOOL_HANDLERS.keys()),
-        "workspace": str(WORKDIR),
         "memories": memories,
+        "connected_mcp": list(mcp_clients.keys()),
+        "active_teammates": list(active_teammates.keys()),
     }
 
 # ═══════════════════════════════════════════════════════════
@@ -1143,14 +1401,7 @@ def consolidate_memories():
 
 
 def build_system() -> str:
-    index = read_memory_index()
-    memories_section = f"\n\nMemories available:\n{index}" if index else ""
-    return (
-        f"You are a coding agent at {WORKDIR}."
-        f"{memories_section}\n"
-        "Relevant memories are injected below. Respect user preferences from memory.\n"
-        "When the user says 'remember' or expresses a clear preference, extract it as a memory."
-    )
+    return assemble_system_prompt({})
 
 # ═══════════════════════════════════════════════════════════
 #  NEW in s08: Four-Layer Compaction Pipeline
@@ -1285,6 +1536,72 @@ def reactive_compact(messages):
     return [{"role": "user", "content": f"[Reactive compact]\n\n{summary}"}, *messages[tail_start:]]
 
 # ═══════════════════════════════════════════════════════════
+#  NEW in s19: Error Recovery
+# ═══════════════════════════════════════════════════════════
+
+DEFAULT_MAX_TOKENS = 8000
+ESCALATED_MAX_TOKENS = 16000
+MAX_RETRIES = 3
+MAX_CONSECUTIVE_529 = 2
+MAX_RECOVERY_RETRIES = 2
+BASE_DELAY_MS = 500
+CONTINUATION_PROMPT = "Continue from the previous response. Do not repeat completed work."
+
+
+class RecoveryState:
+    def __init__(self):
+        self.has_escalated = False
+        self.recovery_count = 0
+        self.consecutive_529 = 0
+        self.has_attempted_reactive_compact = False
+        self.current_model = MODEL
+
+
+def retry_delay(attempt: int) -> float:
+    base = min(BASE_DELAY_MS * (2 ** attempt), 32000) / 1000
+    return base + random.uniform(0, base * 0.25)
+
+
+def is_prompt_too_long_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return (("prompt" in msg and "long" in msg)
+            or "context_length_exceeded" in msg
+            or "max_context_window" in msg)
+
+
+def with_retry(fn, state: RecoveryState):
+    for attempt in range(MAX_RETRIES):
+        try:
+            result = fn()
+            state.consecutive_529 = 0
+            return result
+        except Exception as e:
+            name = type(e).__name__.lower()
+            msg = str(e).lower()
+            if "ratelimit" in name or "429" in msg:
+                delay = retry_delay(attempt)
+                print(f"  \033[33m[429] retry {attempt + 1}/{MAX_RETRIES} "
+                      f"after {delay:.1f}s\033[0m")
+                time.sleep(delay)
+                continue
+            if "overloaded" in name or "529" in msg or "overloaded" in msg:
+                state.consecutive_529 += 1
+                if state.consecutive_529 >= MAX_CONSECUTIVE_529:
+                    fallback = os.getenv("FALLBACK_MODEL_ID")
+                    if fallback:
+                        state.current_model = fallback
+                        state.consecutive_529 = 0
+                        print(f"  \033[31m[529] switching to {fallback}\033[0m")
+                delay = retry_delay(attempt)
+                print(f"  \033[33m[529] retry {attempt + 1}/{MAX_RETRIES} "
+                      f"after {delay:.1f}s\033[0m")
+                time.sleep(delay)
+                continue
+            raise
+    raise RuntimeError(f"Max retries ({MAX_RETRIES}) exceeded")
+
+
+# ═══════════════════════════════════════════════════════════
 #  NEW in s07: SKILL技能
 # ═══════════════════════════════════════════════════════════
 SKILL_REGISTRY: dict[str, dict] = {}
@@ -1320,55 +1637,55 @@ _scan_skills()
 def list_skills() -> str:
     return "\n".join(f"- **{s['name']}**: {s['description']}" for s in SKILL_REGISTRY.values())
 def build_system_prompt() -> str:
-    catalog = list_skills()
-    return (
-        f"You are a coding agent at {WORKDIR}. "
-        f"Skills available:\n{catalog}\n"
-        "Use load_skill to get full details when needed."
-    )
+    return assemble_system_prompt({})
 
 SYSTEM = build_system_prompt()
 
 # --工具调用 函数，执行bash命令并返回结果
-def run_bash(command: str) -> str:
-    dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(d in command for d in dangerous):
-        return "Command is too dangerous to run."
+def run_bash(command: str, run_in_background: bool = False,
+             cwd: Path = None) -> str:
+    # run_in_background is consumed by the dispatcher; direct execution ignores it
     try:
-        result = subprocess.run(command, shell=True, cwd=WORKDIR,
+        r = subprocess.run(command, shell=True, cwd=cwd or WORKDIR,
                            capture_output=True, text=True, timeout=120)
-        return (result.stdout + result.stderr).strip()
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
 
 # 新增4工具调用
-def safe_path(path: str) -> Path:
-    path = (WORKDIR / path).resolve()
-    if not path.is_relative_to(WORKDIR):
+def safe_path(path: str, cwd: Path = None) -> Path:
+    base = cwd or WORKDIR
+    path = (base / path).resolve()
+    if not path.is_relative_to(base):
         raise ValueError(f"Path escapes workspace: {path}")
     return path
-def run_read(path: str, limit: int | None = None) -> str:
+
+def run_read(path: str, limit: int | None = None, offset: int = 0,
+             cwd: Path = None) -> str:
     try:
-        lines = safe_path(path).read_text().splitlines()
+        lines = safe_path(path, cwd).read_text().splitlines()
+        offset = max(int(offset or 0), 0)
+        lines = lines[offset:]
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)
     except Exception as e:
         return f"Error: {e}"
 
-def run_write(path: str, content: str) -> str:
+def run_write(path: str, content: str, cwd: Path = None) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = safe_path(path, cwd)
         file_path.parent.mkdir(parents=True, exist_ok=True)
         file_path.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
         return f"Error: {e}"
-def run_edit(path: str, old_text: str, new_text: str) -> str:
+
+def run_edit(path: str, old_text: str, new_text: str,
+             cwd: Path = None) -> str:
     try:
-        file_path = safe_path(path)
+        file_path = safe_path(path, cwd)
         text = file_path.read_text()
         if old_text not in text:
             return f"Error: text not found in {path}"
@@ -1376,12 +1693,14 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"Edited {path}"
     except Exception as e:
         return f"Error: {e}"
-def run_glob(pattern: str) -> str:
+
+def run_glob(pattern: str, cwd: Path = None) -> str:
     import glob as g
     try:
+        base = cwd or WORKDIR
         results = []
-        for match in g.glob(pattern,root_dir=WORKDIR):
-            if (WORKDIR / match).resolve().is_relative_to(WORKDIR):
+        for match in g.glob(pattern, root_dir=base):
+            if (base / match).resolve().is_relative_to(base):
                 results.append(match)
         return "\n".join(results) if results else "No matches found."
     except Exception as e:
@@ -1449,6 +1768,22 @@ def extract_text(content) -> str:
     if not isinstance(content, list):
         return str(content)
     return "\n".join(getattr(b, "text", "") for b in content if getattr(b, "type", None) == "text")
+
+
+def has_tool_use(content) -> bool:
+    return any(getattr(block, "type", None) == "tool_use"
+               for block in content)
+
+
+def call_tool_handler(handler, args: dict, name: str) -> str:
+    if not handler:
+        return f"Unknown: {name}"
+    try:
+        return handler(**(args or {}))
+    except TypeError as e:
+        return f"Error: {e}"
+
+
 def spawn_subagent(description: str) -> str:
     """Spawn a subagent with fresh messages[], return summary only."""
     print(f"\n\033[35m[Subagent spawned]\033[0m")
@@ -1460,125 +1795,178 @@ def spawn_subagent(description: str) -> str:
             messages=messages, tools=SUB_TOOLS, max_tokens=8000,
         )
         messages.append({"role": "assistant", "content": response.content})
-        if response.stop_reason != "tool_use":
+        if not has_tool_use(response.content):
             break
         results = []
         for block in response.content:
-            if block.type == "tool_use":
-                # Issue 1: subagent also runs hooks (permissions apply)
-                blocked = trigger_hook("PreToolUse", block)
-                if blocked:
-                    results.append({"type": "tool_result", "tool_use_id": block.id,
-                                    "content": str(blocked)})
-                    continue
-                handler = SUB_HANDLERS.get(block.name)
-                output = handler(**block.input) if handler else f"Unknown: {block.name}"
-                trigger_hook("PostToolUse", block, output)
-                print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+            if block.type != "tool_use":
+                continue
+            blocked = trigger_hook("PreToolUse", block)
+            if blocked:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": output})
+                                "content": str(blocked)})
+                continue
+            handler = SUB_HANDLERS.get(block.name)
+            output = call_tool_handler(handler, block.input, block.name)
+            trigger_hook("PostToolUse", block, output)
+            print(f"  \033[90m[sub] {block.name}: {str(output)[:100]}\033[0m")
+            results.append({"type": "tool_result", "tool_use_id": block.id,
+                            "content": output})
         messages.append({"role": "user", "content": results})
-        # Issue 5: fallback if safety limit hit during tool_use
 
-    result = extract_text(messages[-1]["content"])
-    if not result:
-        # last message is tool_result, look backwards for assistant text
-        for msg in reversed(messages):
-            if msg["role"] == "assistant":
-                result = extract_text(msg["content"])
-                if result:
-                    break
-        if not result:
-            result = "Subagent stopped after 30 turns without final answer."
+    for msg in reversed(messages):
+        if msg["role"] == "assistant":
+            text = extract_text(msg["content"])
+            if text:
+                print(f"\033[35m[Subagent done]\033[0m")
+                return text
+    result = "Subagent finished without a text summary."
     print(f"\033[35m[Subagent done]\033[0m")
-    return result  # only summary, entire message history discarded
+    return result
 # ═══════════════════════════════════════════════════════════
 #  NEW in s02: 工具定义（s01 只有一个 bash，现在扩展到 5 个）
 # ═══════════════════════════════════════════════════════════
 
 TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
-     "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"command": {"type": "string"},
+                                     "run_in_background": {"type": "boolean"}},
+                      "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}}, "required": ["path"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"path": {"type": "string"},
+                                     "limit": {"type": "integer"},
+                                     "offset": {"type": "integer"}},
+                      "required": ["path"]}},
     {"name": "write_file", "description": "Write content to a file.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"path": {"type": "string"},
+                                     "content": {"type": "string"}},
+                      "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in a file once.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"path": {"type": "string"},
+                                     "old_text": {"type": "string"},
+                                     "new_text": {"type": "string"}},
+                      "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern.",
-     "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
-{"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
-    },
+     "input_schema": {"type": "object",
+                      "properties": {"pattern": {"type": "string"}},
+                      "required": ["pattern"]}},
+    {"name": "todo_write", "description": "Create and manage a task list.",
+     "input_schema": {"type": "object",
+                      "properties": {"todos": {"type": "array",
+                          "items": {"type": "object",
+                                    "properties": {
+                                        "content": {"type": "string"},
+                                        "status": {"type": "string",
+                                                   "enum": ["pending", "in_progress", "completed"]}},
+                                    "required": ["content", "status"]}}},
+                      "required": ["todos"]}},
+    {"name": "task",
+     "description": "Launch a focused subagent. Returns only its final summary.",
+     "input_schema": {"type": "object",
+                      "properties": {"description": {"type": "string"}},
+                      "required": ["description"]}},
     {"name": "load_skill", "description": "Load the full content of a skill by name.",
-     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
-{
-    "name": "task",
-    "description": "Launch a subagent to handle a complex subtask. Returns only the final conclusion.",
-    "input_schema": {"type": "object", "properties": {"description": {"type": "string"}}, "required": ["description"]},
-},
-    {"name": "compact", "description": "Summarize earlier conversation to free context space.",
-     "input_schema": {"type": "object", "properties": {"focus": {"type": "string"}}}},
-    {"name": "create_task",
-     "description": "Create a new task with optional blockedBy dependencies.",
      "input_schema": {"type": "object",
-                      "properties": {
-                          "subject": {"type": "string"},
-                          "description": {"type": "string"},
-                          "blockedBy": {"type": "array",
-                                        "items": {"type": "string"}}},
-                      "required": ["subject"]}},
-    {"name": "list_tasks",
-     "description": "List all tasks with status, owner, and dependencies.",
-     "input_schema": {"type": "object", "properties": {},
+                      "properties": {"name": {"type": "string"}},
+                      "required": ["name"]}},
+    {"name": "compact",
+     "description": "Summarize earlier conversation to free context space.",
+     "input_schema": {"type": "object",
+                      "properties": {"focus": {"type": "string"}},
                       "required": []}},
-    {"name": "get_task",
-     "description": "Get full details of a specific task by ID.",
+    {"name": "create_task", "description": "Create a new task with optional dependencies.",
+     "input_schema": {"type": "object",
+                      "properties": {"subject": {"type": "string"},
+                                     "description": {"type": "string"},
+                                     "blockedBy": {"type": "array",
+                                                   "items": {"type": "string"}}},
+                      "required": ["subject"]}},
+    {"name": "list_tasks", "description": "List all tasks with status and owner.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "get_task", "description": "Get full details of a specific task.",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "claim_task",
-     "description": "Claim a pending task. Sets owner, changes status to in_progress.",
+    {"name": "claim_task", "description": "Claim a pending task.",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "complete_task",
-     "description": "Complete an in-progress task. Reports unblocked downstream tasks.",
+    {"name": "complete_task", "description": "Complete an in-progress task.",
      "input_schema": {"type": "object",
                       "properties": {"task_id": {"type": "string"}},
                       "required": ["task_id"]}},
-    {"name": "spawn_teammate",
-     "description": "Spawn a teammate agent in a background thread.",
+    {"name": "schedule_cron",
+     "description": "Schedule a cron job. 5-field: min hour dom month dow.",
      "input_schema": {"type": "object",
-                      "properties": {
-                          "name": {"type": "string"},
-                          "role": {"type": "string"},
-                          "prompt": {"type": "string"}},
+                      "properties": {"cron": {"type": "string"},
+                                     "prompt": {"type": "string"},
+                                     "recurring": {"type": "boolean"},
+                                     "durable": {"type": "boolean"}},
+                      "required": ["cron", "prompt"]}},
+    {"name": "list_crons", "description": "List registered cron jobs.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "cancel_cron", "description": "Cancel a cron job by ID.",
+     "input_schema": {"type": "object",
+                      "properties": {"job_id": {"type": "string"}},
+                      "required": ["job_id"]}},
+    {"name": "spawn_teammate", "description": "Spawn an autonomous teammate.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "role": {"type": "string"},
+                                     "prompt": {"type": "string"}},
                       "required": ["name", "role", "prompt"]}},
-    {"name": "send_message",
-     "description": "Send a message to a teammate via MessageBus.",
+    {"name": "send_message", "description": "Send a message to a teammate.",
      "input_schema": {"type": "object",
                       "properties": {"to": {"type": "string"},
                                      "content": {"type": "string"}},
                       "required": ["to", "content"]}},
     {"name": "check_inbox",
-     "description": "Check Lead's inbox for teammate messages.",
-     "input_schema": {"type": "object", "properties": {},
-                      "required": []}},
+     "description": "Check Lead's inbox for protocol responses.",
+     "input_schema": {"type": "object", "properties": {}, "required": []}},
+    {"name": "request_shutdown",
+     "description": "Request a teammate to shut down.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"}},
+                      "required": ["teammate"]}},
+    {"name": "request_plan",
+     "description": "Ask a teammate to submit a plan.",
+     "input_schema": {"type": "object",
+                      "properties": {"teammate": {"type": "string"},
+                                     "task": {"type": "string"}},
+                      "required": ["teammate", "task"]}},
+    {"name": "review_plan",
+     "description": "Approve or reject a submitted plan.",
+     "input_schema": {"type": "object",
+                      "properties": {"request_id": {"type": "string"},
+                                     "approve": {"type": "boolean"},
+                                     "feedback": {"type": "string"}},
+                      "required": ["request_id", "approve"]}},
+    {"name": "create_worktree",
+     "description": "Create an isolated git worktree.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "task_id": {"type": "string"}},
+                      "required": ["name"]}},
+    {"name": "remove_worktree",
+     "description": "Remove a worktree. Refuses if changes exist.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"},
+                                     "discard_changes": {"type": "boolean"}},
+                      "required": ["name"]}},
+    {"name": "keep_worktree",
+     "description": "Keep a worktree for manual review.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"}},
+                      "required": ["name"]}},
+    {"name": "connect_mcp",
+     "description": "Connect to an MCP server (docs, deploy) and discover tools.",
+     "input_schema": {"type": "object",
+                      "properties": {"name": {"type": "string"}},
+                      "required": ["name"]}},
 ]
 
 # ═══════════════════════════════════════════════════════════
@@ -1587,117 +1975,199 @@ TOOLS = [
 
 TOOL_HANDLERS = {
     "bash": run_bash, "read_file": run_read, "write_file": run_write,
-    "edit_file": run_edit, "glob": run_glob,  "todo_write": run_todo_write,
-    "task": spawn_subagent, "load_skill": load_skill,  "create_task": run_create_task, "list_tasks": run_list_tasks,
+    "edit_file": run_edit, "glob": run_glob, "todo_write": run_todo_write,
+    "task": spawn_subagent, "load_skill": load_skill,
+    "create_task": run_create_task, "list_tasks": run_list_tasks,
     "get_task": run_get_task, "claim_task": run_claim_task,
     "complete_task": run_complete_task,
+    "schedule_cron": run_schedule_cron,
+    "list_crons": run_list_crons,
+    "cancel_cron": run_cancel_cron,
+    "spawn_teammate": run_spawn_teammate,
+    "send_message": run_send_message, "check_inbox": run_check_inbox,
+    "request_shutdown": run_request_shutdown,
+    "request_plan": run_request_plan,
+    "review_plan": run_review_plan,
+    "create_worktree": run_create_worktree,
+    "remove_worktree": run_remove_worktree,
+    "keep_worktree": run_keep_worktree,
+    "connect_mcp": connect_mcp,
 }
+
+# Aliases for assemble_tool_pool compatibility
+BUILTIN_TOOLS = TOOLS
+BUILTIN_HANDLERS = TOOL_HANDLERS
 rounds_since_todo = 0
 
 MAX_REACTIVE_RETRIES = 1
+
+
+def prepare_context(messages: list) -> list:
+    """Every LLM turn enters through the same context budget pipeline."""
+    messages[:] = tool_result_budget(messages)    # L3: persist large results
+    messages[:] = snip_compact(messages)          # L1: trim middle
+    messages[:] = micro_compact(messages)         # L2: old result placeholders
+    if estimate_size(messages) > CONTEXT_LIMIT:
+        print("[auto compact]")
+        messages[:] = compact_history(messages)
+    return messages
+
+
+def build_user_content(results: list[dict]) -> list[dict]:
+    """Tool results + completed background notifications."""
+    content = list(results)
+    for note in collect_background_results():
+        content.append({"type": "text", "text": note})
+    return content
+
+
+def inject_background_notifications(messages: list):
+    notes = collect_background_results()
+    if notes:
+        messages.append({"role": "user", "content": [
+            {"type": "text", "text": note} for note in notes]})
+
+
 def agent_loop(messages: list, context: dict):
     global rounds_since_todo
+    tools, handlers = assemble_tool_pool()
+    state = RecoveryState()
+    max_tokens = DEFAULT_MAX_TOKENS
     reactive_retries = 0
+
     # s09: inject relevant memory content into the current user turn
     memories_content = load_memories(messages)
     memory_turn = len(messages) - 1 if messages and isinstance(messages[-1].get("content"), str) else None
-    # s09: build system once per user turn; memory is updated after the loop returns
-    system = get_system_prompt(context)
 
     while True:
-        pre_compress = [m if isinstance(m, dict) else {"role": m.get("role", ""),
-                                                       "content": str(m.get("content", ""))} for m in messages]
-        # s08 change: three preprocessors (0 API calls, cheap first)
-        # Order matches CC source: budget → snip → micro
-        messages[:] = tool_result_budget(messages)    # L3: persist large results first
-        messages[:] = snip_compact(messages)          # L1: trim middle
-        messages[:] = micro_compact(messages)         # L2: old result placeholders
+        # Consume cron queue and inject fired jobs
+        fired = consume_cron_queue()
+        for job in fired:
+            messages.append({"role": "user",
+                             "content": f"[Scheduled] {job.prompt}"})
+            print(f"  \033[35m[cron inject] {job.prompt[:60]}\033[0m")
 
-        # s08 change: tokens still over threshold → LLM summary (1 API call)
-        if estimate_size(messages) > CONTEXT_LIMIT:
-            print("[auto compact]")
-            messages[:] = compact_history(messages)
+        # Inject background task notifications
+        inject_background_notifications(messages)
 
-        # 注入todo_write工具的当前任务列表
+        # Todo reminder
         if rounds_since_todo >= 3 and messages:
             messages.append({"role": "user",
                              "content": "<reminder>Update your todos.</reminder>"})
             rounds_since_todo = 0
 
+        # Context budget pipeline
+        pre_compress = [m if isinstance(m, dict) else {"role": m.get("role", ""),
+                                                       "content": str(m.get("content", ""))} for m in messages]
+        prepare_context(messages)
+        context = update_context(context, messages)
+        tools, handlers = assemble_tool_pool()
+        system = get_system_prompt(context)
+
+        # Inject memories into the last user message
+        request_messages = messages
+        if memories_content and memory_turn is not None and memory_turn < len(messages):
+            request_messages = messages.copy()
+            request_messages[memory_turn] = {
+                **messages[memory_turn],
+                "content": memories_content + "\n\n" + messages[memory_turn]["content"],
+            }
+
         try:
-            request_messages = messages
-            if memories_content and memory_turn is not None and memory_turn < len(messages):
-                request_messages = messages.copy()
-                request_messages[memory_turn] = {
-                    **messages[memory_turn],
-                    "content": memories_content + "\n\n" + messages[memory_turn]["content"],
-                }
-            response = client.messages.create(
-            model=MODEL, system=system, messages=request_messages,
-            tools=TOOLS, max_tokens=8000,
-            )
-            reactive_retries = 0  # reset on successful API call
+            response = with_retry(
+                lambda: client.messages.create(
+                    model=state.current_model,
+                    system=system, messages=request_messages,
+                    tools=tools, max_tokens=max_tokens),
+                state)
+            reactive_retries = 0
         except Exception as e:
-            if ("prompt_too_long" in str(e).lower() or "too many tokens" in str(
-                    e).lower()) and reactive_retries < MAX_REACTIVE_RETRIES:
+            if is_prompt_too_long_error(e) and not state.has_attempted_reactive_compact:
                 print("[reactive compact]")
                 messages[:] = reactive_compact(messages)
-                reactive_retries += 1
+                state.has_attempted_reactive_compact = True
                 continue
-            raise
-        # 将大模型的回复加入messages中
+            messages.append({"role": "assistant", "content": [
+                {"type": "text", "text": f"[Error] {type(e).__name__}: {e}"}]})
+            return
+
+        # Handle max_tokens truncation
+        if response.stop_reason == "max_tokens":
+            if not state.has_escalated:
+                max_tokens = ESCALATED_MAX_TOKENS
+                state.has_escalated = True
+                print(f"  \033[33m[max_tokens] retry with {max_tokens}\033[0m")
+                continue
+            messages.append({"role": "assistant", "content": response.content})
+            if state.recovery_count < MAX_RECOVERY_RETRIES:
+                messages.append({"role": "user", "content": CONTINUATION_PROMPT})
+                state.recovery_count += 1
+                continue
+            return
+
+        max_tokens = DEFAULT_MAX_TOKENS
+        state.has_escalated = False
         messages.append({"role": "assistant", "content": response.content})
-        # 如果大模型不使用工具就做完任务
-        if response.stop_reason != "tool_use":
+
+        # Stop if no tool_use
+        if not has_tool_use(response.content):
             force = trigger_hook("Stop", messages)
-            # s09: extract from pre-compression snapshot for full fidelity
             extract_memories(pre_compress)
             consolidate_memories()
             if force:
                 messages.append({"role": "user", "content": force})
-                continue  # 继续循环，不退出
+                continue
             return
-        rounds_since_todo += 1
-        # 执行工具调用，收集结果
+
+        # Execute tool calls
         results = []
+        compacted_now = False
         for block in response.content:
-            if block.type != "tool_use": continue
+            if block.type != "tool_use":
+                continue
             print(f"\033[36m> {block.name}\033[0m")
 
-            # s08: compact tool triggers compact_history, not a no-op string
             if block.name == "compact":
-                # Pop the assistant message we just added so compact_history
-                # only compresses older turns. Then re-add it so the
-                # tool_use → tool_result pair stays intact for the API.
-                last_assistant = messages.pop()
                 messages[:] = compact_history(messages)
-                messages.append(last_assistant)
-                results.append({"type": "tool_result", "tool_use_id": block.id,
-                                "content": "[Compacted. Conversation history has been summarized.]"})
-                messages.append({"role": "user", "content": results})
-                break  # end current turn, start fresh with compacted context
-
+                messages.append({"role": "user",
+                                 "content": "[Compacted. Continue with summarized context.]"})
+                compacted_now = True
+                break
 
             blocked = trigger_hook("PreToolUse", block)
             if blocked is not None:
                 results.append({"type": "tool_result", "tool_use_id": block.id,
                                 "content": str(blocked)})
                 continue
-            handler = TOOL_HANDLERS.get(block.name)
-            output = handler(**block.input) if handler else f"No handler for tool {block.name}"
+
+            # Background dispatch for slow operations
+            if should_run_background(block.name, block.input):
+                bg_id = start_background_tasks(block)
+                output = (f"[Background task {bg_id} started] "
+                          "Result will arrive as a task_notification.")
+                results.append({"type": "tool_result",
+                                "tool_use_id": block.id,
+                                "content": output})
+                continue
+
+            handler = handlers.get(block.name)
+            output = call_tool_handler(handler, block.input, block.name)
             trigger_hook("PostToolUse", block, output)
-            context = update_context(context, messages)
-            system = get_system_prompt(context)
+            print(str(output)[:300])
+
             if block.name == "todo_write":
                 rounds_since_todo = 0
+            else:
+                rounds_since_todo += 1
 
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
-            })
-        # 将assistant的工具调用和工具结果接入messages中，继续对话
-        messages.append({"role": "user", "content": results})
+            results.append({"type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": output})
+
+        if compacted_now:
+            continue
+
+        messages.append({"role": "user", "content": build_user_content(results)})
 
 # ═══════════════════════════════════════════════════════════
 #  NEW in s03: 权限配置
@@ -1758,24 +2228,31 @@ def context_inject_hook(query: str) -> str | None:
     """Inject current working directory info into every prompt."""
     print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
     return None   # return None = no modification, let prompt through
-def permission_hook(block) :
+def permission_hook(block):
     if block.name == "bash":
+        command = block.input.get("command", "")
         for d in DENY_LIST:
-            if d in block.input.get("command", ""):
-                print(f"\n⛔ [HOOK]Command is too dangerous to run: {d}")
-                return "Permission denied by user"
+            if d in command:
+                print(f"\n⛔ [HOOK] Command denied: {d}")
+                return f"Permission denied: '{d}' is on the deny list"
         for kw in DESTRUCTIVE:
-            if kw in block.input.get("command", ""):
+            if kw in command:
                 print(f"\n\033[33m[HOOK] Potentially destructive command\033[0m")
-                print(f"   [HOOK]Tool: {block.name}({block.input})")
+                print(f"   [HOOK] {command}")
                 choice = input("   Allow? [y/N] ").strip().lower()
                 if choice not in ("y", "yes"):
                     return "Permission denied by user"
     if block.name in ["write_file", "edit_file"]:
-        if not (WORKDIR / block.input.get("path", "")).resolve().is_relative_to(WORKDIR):
-            choice = input(f"\n⚠ File path escapes workspace: {block.input.get('path')}. Allow? [y/N] ").strip().lower()
-            if choice not in ("y", "yes"):
-                return "Permission denied by user"
+        try:
+            safe_path(block.input.get("path", ""))
+        except Exception:
+            return f"Permission denied: path escapes workspace: {block.input.get('path')}"
+    if block.name.startswith("mcp__") and "deploy" in block.name:
+        print(f"\n\033[33m[permission] MCP destructive tool: {block.name}\033[0m")
+        choice = input("  Allow? [y/N] ").strip().lower()
+        if choice not in ("y", "yes"):
+            return "Permission denied by user"
+    return None
 
 # PreToolUse hook: before tool use, check permission
 def log_hook(block):
@@ -1833,7 +2310,11 @@ SUB_TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
-     "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+     "input_schema": {"type": "object",
+                      "properties": {"path": {"type": "string"},
+                                     "limit": {"type": "integer"},
+                                     "offset": {"type": "integer"}},
+                      "required": ["path"]}},
     {"name": "write_file", "description": "Write content to a file.",
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
     {"name": "edit_file", "description": "Replace exact text in a file once.",
@@ -1855,26 +2336,68 @@ SUB_HANDLERS = {
 
 
 
+def cron_autorun_loop(history: list, context: dict):
+    """Background thread: auto-trigger agent_loop when cron fires."""
+    while True:
+        time.sleep(1)
+        fired = consume_cron_queue()
+        if not fired:
+            continue
+        with agent_lock:
+            turn_start = len(history)
+            for job in fired:
+                history.append({"role": "user",
+                                "content": f"[Scheduled] {job.prompt}"})
+                print(f"  \033[35m[cron auto] {job.prompt[:60]}\033[0m")
+            agent_loop(history, context)
+            context.update(update_context(context, history))
+            # Print assistant responses
+            for msg in history[turn_start:]:
+                if msg.get("role") != "assistant":
+                    continue
+                for block in msg.get("content", []):
+                    if getattr(block, "type", None) == "text":
+                        print(block.text)
+
+
 if __name__ == "__main__":
     print("输入问题，回车发送。输入 q / quit / exit 退出。\n")
-    # 用来记录与大模型的历史对话
-    history =  []
-    context = update_context({},[])
+    history = []
+    context = update_context({}, [])
+    threading.Thread(target=cron_autorun_loop,
+                     args=(history, context), daemon=True).start()
     while True:
         try:
-            query = input("\033[36ms01 >> \033[0m")
+            query = input("\033[36ms20 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "quit", "exit", ""):
             break
         trigger_hook("UserPromptSubmit", query)
+        turn_start = len(history)
         history.append({"role": "user", "content": query})
-        agent_loop(history,context)
-        # 打印与模型对话的最后一行的回复
-        response_content = history[-1]["content"]
-        if isinstance(response_content, list):
-            for block in response_content:
-                if getattr(block, "type", None) == "text":
-                    print(block.text)
+        with agent_lock:
+            agent_loop(history, context)
+            context = update_context(context, history)
+            # Print assistant responses
+            for msg in history[turn_start:]:
+                if msg.get("role") != "assistant":
+                    continue
+                for block in msg.get("content", []):
+                    if getattr(block, "type", None) == "text":
+                        print(block.text)
+
+        # Consume lead inbox for protocol messages
+        inbox = consume_lead_inbox(route_protocol=True)
+        if inbox:
+            inbox_lines = []
+            for m in inbox:
+                meta = m.get("metadata", {})
+                req_id = meta.get("request_id", "")
+                tag = f" [{m['type']} req:{req_id}]" if req_id else f" [{m['type']}]"
+                inbox_lines.append(f"From {m['from']}{tag}: {m['content'][:200]}")
+            inbox_text = "\n".join(inbox_lines)
+            history.append({"role": "user",
+                            "content": f"[Inbox]\n{inbox_text}"})
         print()
 
